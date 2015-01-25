@@ -4,22 +4,16 @@ open Printf
 open Nethtml
 open Syndic
 
-let planet_url = "/community/planet/"
-let planet_full_url = "http://ocaml.org/community/planet/"
+let planet_url = Uri.of_string "/community/planet/"
+let planet_full_url = Uri.of_string "//ocaml.org/community/planet/"
 
 let planet_feeds_file = "planet_feeds.txt"
 
 (* Utils
  ***********************************************************************)
 
-type html = Nethtml.document list
-
-let encode_html =
-  Netencoding.Html.encode ~prefer_name:false ~in_enc:`Enc_utf8 ()
-
-let decode_document html = Nethtml.decode ~enc:`Enc_utf8 html
-
-let encode_document html = Nethtml.encode ~enc:`Enc_utf8 html
+(* Qualify [name] with an empty namespace. *)
+let n name : Xmlm.name = ("", name)
 
 (* Remove all tags *)
 let rec syndic_to_buffer b = function
@@ -36,53 +30,53 @@ let string_of_text_construct : Atom.text_construct -> string = function
   | Atom.Text s | Atom.Html(_,s) -> s
   | Atom.Xhtml(_, x) -> syndic_to_string x
 
+let attr_is name = fun ((ns,t), _) ->
+  ns = "" && t = name
 
-let rec resolve ?xmlbase html =
+let rec resolve ?xmlbase (html: Cow.Html.t) =
   List.map (resolve_links_el ~xmlbase) html
 and resolve_links_el ~xmlbase = function
-  | Nethtml.Element("a", attrs, sub) ->
-     let attrs = match List.partition (fun (t,_) -> t = "href") attrs with
+  | `El((("","a"), attrs), sub) ->
+     let attrs = match List.partition (attr_is "href") attrs with
        | [], _ -> attrs
        | (_, h) :: _, attrs ->
           let src = Uri.to_string(XML.resolve xmlbase (Uri.of_string h)) in
-          ("href", src) :: attrs in
-     Nethtml.Element("a", attrs, resolve ?xmlbase sub)
-  | Nethtml.Element("img", attrs, sub) ->
-     let attrs = match List.partition (fun (t,_) -> t = "src") attrs with
+          (n"href", src) :: attrs in
+     `El((n"a", attrs), resolve ?xmlbase sub)
+  | `El((("","img"), attrs), sub) ->
+     let attrs = match List.partition (attr_is "src") attrs with
        | [], _ -> attrs
        | (_, src) :: _, attrs ->
           let src = Uri.to_string(XML.resolve xmlbase (Uri.of_string src)) in
-          ("src", src) :: attrs in
-     Nethtml.Element("img", attrs, sub)
-  | Nethtml.Element(e, attrs, sub) ->
-     Nethtml.Element(e, attrs, resolve ?xmlbase sub)
-  | Data _ as d -> d
+          (n"src", src) :: attrs in
+     `El((n"img", attrs), sub)
+  | `El(tag, sub) ->
+     `El(tag, resolve ?xmlbase sub)
+  | `Data _ as d -> d
 
 
 (* Things that posts should not contain *)
-let undesired_tags = ["style"; "script"]
-let undesired_attr = ["id"]
+let undesired_tags = [n "style"; n "script"]
+let undesired_attr = [n "id"]
 
 let remove_undesired_attr =
   List.filter (fun (a,_) -> not(List.mem a undesired_attr))
 
-let rec remove_undesired_tags html =
+let rec remove_undesired_tags (html: Cow.Html.t) =
   Utils.filter_map html remove_undesired_tags_el
 and remove_undesired_tags_el = function
-  | Nethtml.Element(t, a, sub) ->
+  | `El((t, a), sub) ->
      if List.mem t undesired_tags then None
-     else Some(Nethtml.Element(t, remove_undesired_attr a,
-                               remove_undesired_tags sub))
-  | Data _ as d -> Some d
+     else Some(`El((t, remove_undesired_attr a),
+                   remove_undesired_tags sub))
+  | `Data _ as d -> Some d
 
 let html_of_text ?xmlbase s =
-  try Nethtml.parse (new Netchannels.input_string s)
-                    ~dtd:Utils.relaxed_html40_dtd
-      |> decode_document
+  try Cow.Html.of_string s
       |> resolve ?xmlbase
       |> remove_undesired_tags
   with _ ->
-    [Nethtml.Data(encode_html s)]
+    [`Data s]
 
 (* Do not trust sites using XML for HTML content.  Convert to string
    and parse back.  (Does not always fix bad HTML unfortunately.) *)
@@ -111,28 +105,29 @@ let classify_feed ~xmlbase (xml: string) =
 type contributor = {
     name  : string;
     title : string;
-    url   : string;
+    url   : Uri.t option;
     feed  : feed;
   }
 
-let feed_of_url ~name url =
+let feed_of_url ~name url_s =
+  let url = Uri.of_string url_s in
   try
-    let xmlbase = Uri.of_string url in
-    let feed = classify_feed ~xmlbase (Http.get url) in
+    let feed = classify_feed ~xmlbase:url (Http.get url_s) in
     let title = match feed with
       | Atom atom -> string_of_text_construct atom.Atom.title
       | Rss2 ch -> ch.Rss2.title
       | Broken _ -> "" in
-    { name;  title;  url;  feed }
+    { name;  title;  url = Some url;  feed }
   with
   | Http_client.Http_protocol(Http_client.Timeout s)
   | Http_client.Http_protocol(Http_client.Name_resolution_error s) ->
-     { name;  title = "";  url;  feed = Broken s }
+     { name;  title = "";  url = Some url;  feed = Broken s }
   | Http_client.Http_protocol Http_client.Too_many_redirections ->
-     { name;  title = "";  url;  feed = Broken "Too many redirections" }
+     { name;  title = "";  url = Some url;
+       feed = Broken "Too many redirections" }
   | Http_client.Http_error(err, _) ->
      let msg = Nethttp.(string_of_http_status (http_status_of_int err)) in
-     { name;  title = "";  url;  feed = Broken msg }
+     { name;  title = "";  url = Some url;  feed = Broken msg }
 
 let planet_feeds =
   let add_feed acc line =
@@ -150,10 +145,14 @@ let html_contributors () =
     List.sort (fun c1 c2 -> String.compare c1.name c2.name) feeds in
   let contrib_html c =
     let attr = match c.feed with
-      | Broken s -> ["class", "broken";  "title", encode_html s]
+      | Broken s -> [n"class", "broken";  n"title", s]
       | _ -> [] in
-    Element("li", [], [Element("a", ("href", c.url) :: attr, [Data c.name])]) in
-  [Element("ul", [], List.map contrib_html contributors)]
+    let li = match c.url with
+      | Some u -> [`El((n"a", (n"href", Uri.to_string u) :: attr),
+                      [`Data c.name])]
+      | None -> [`Data c.name] in
+    `El((n"li", []), li) in
+  [`El((n"ul", []), List.map contrib_html contributors)]
 
 
 let to_opml feeds =
@@ -164,8 +163,8 @@ let to_opml feeds =
                                "OCaml Planet" in
   let outline f =
     Syndic.Opml1.outline ~typ:"rss"
-                         ~attrs:[("", "title"), f.title]
-                         ~xml_url:(Uri.of_string f.url)
+                         ~attrs:[n "title", f.title]
+                         ?xml_url:f.url
                          f.name in
   { Syndic.Opml1.version = "1.1";  head;  body = List.map outline feeds }
 
@@ -187,7 +186,7 @@ type post = {
   contributor: contributor;
   author : string;
   email  : string;    (* the author email, "" if none *)
-  desc   : html;
+  desc   : Cow.Html.t;
 }
 
 (* Email on the forge contain the name in parenthesis *)
@@ -290,16 +289,16 @@ let posts_of_contributor c =
 let rec length_html html =
   List.fold_left (fun l h -> l + length_html_el h) 0 html
 and length_html_el = function
-  | Element(_, _, content) -> length_html content
-  | Data d -> String.length d
+  | `El(_, content) -> length_html content
+  | `Data d -> String.length d
 
 let rec text_of_html html =
   String.concat "" (List.map text_of_el html)
 and text_of_el = function
-  | Element(_, _, content) -> text_of_html content
-  | Data d -> d
+  | `El(_, content) -> text_of_html content
+  | `Data d -> d
 
-let rec len_prefix_of_html html len =
+let rec len_prefix_of_html (html: Cow.Html.t) len =
   if len <= 0 then 0, []
   else match html with
        | [] -> len, []
@@ -308,15 +307,15 @@ let rec len_prefix_of_html html len =
                     len, prefix_el :: prefix_tl
 and len_prefix_of_el el len =
   match el with
-  | Data d ->
+  | `Data d ->
      let len' = len - String.length d in
-     len', (if len' >= 0 then el else Data(String.sub d 0 len ^ "…"))
-  | Element(tag, args, content) ->
+     len', (if len' >= 0 then el else `Data(String.sub d 0 len ^ "…"))
+  | `El((tag, args), content) ->
      (* Remove "id" and "name" to avoid duplicate anchors with the
         whole post. *)
-     let args = List.filter (fun (n,_) -> n <> "id" && n <> "name") args in
+     let args = List.filter (fun ((_,n),_) -> n <> "id" && n <> "name") args in
      let len, prefix_content = len_prefix_of_html content len in
-     len, Element(tag, args, prefix_content)
+     len, `El((tag, args), prefix_content)
 
 let rec prefix_of_html html len =
   snd(len_prefix_of_html html len)
@@ -330,18 +329,18 @@ let new_id =
    from [html1] to [html2] and vice versa. *)
 let toggle ?(anchor="") html1 html2 =
   let button id1 id2 text =
-    Element("a", ["onclick", sprintf "switchContent('%s','%s')" id1 id2;
-                  "class", "btn planet-toggle";
-                  "href", "#" ^ anchor],
-            [Data text])
+    `El((n"a", [n"onclick", sprintf "switchContent('%s','%s')" id1 id2;
+                n"class", "btn planet-toggle";
+                n"href", "#" ^ anchor]),
+        [`Data text])
   in
   let id1 = new_id() and id2 = new_id() in
-  [Element("div", ["id", id1],
-           html1 @ [button id1 id2 "Read more..."]);
-   Element("div", ["id", id2; "style", "display: none"],
-           html2 @ [button id2 id1 "Hide"])]
+  [`El((n"div", [n"id", id1]),
+       html1 @ [button id1 id2 "Read more..."]);
+   `El((n"div", [n"id", id2;  n"style", "display: none"]),
+       html2 @ [button id2 id1 "Hide"])]
 
-let toggle_script =
+let toggle_script : Cow.Html.t =
   let script =
     "function switchContent(id1,id2) {
      // Get the DOM reference
@@ -351,7 +350,7 @@ let toggle_script =
      contentId1.style.display = \"none\";
      contentId2.style.display = \"block\";
      }\n" in
-  [Element("script", ["type", "text/javascript"], [Data script])]
+  [`El((n"script", [n"type", "text/javascript"]), [`Data script])]
 
 
 (* In addition to the feed name, print the author name (general feed
@@ -366,15 +365,15 @@ let want_contributor_and_author p =
 let html_author_of_post p =
   if want_contributor_and_author p then
     let author =
-      if p.email = "" then Data p.author
-      else Element("a", ["href", "mailto:" ^ p.email], [Data p.author]) in
-    [Element("span", [],
-             [Data p.contributor.name; Data " ("; author; Data ")" ])]
+      if p.email = "" then `Data p.author
+      else `El((n"a", [n"href", "mailto:" ^ p.email]), [`Data p.author]) in
+    [`El((n"span", []),
+         [`Data p.contributor.name; `Data " ("; author; `Data ")" ])]
   else
     if p.contributor.name = "" then []
-    else if p.email = "" then [Data p.contributor.name]
-    else [Element("a", ["href", "mailto:" ^ p.email],
-                  [Data p.contributor.name])]
+    else if p.email = "" then [`Data p.contributor.name]
+    else [`El((n"a", [n"href", "mailto:" ^ p.email]),
+              [`Data p.contributor.name])]
 
 let html_date_of_post p =
   match p.date with
@@ -383,88 +382,89 @@ let html_date_of_post p =
      let date =
        let open Syndic.Date in
        sprintf "%s %02d, %d" (string_of_month(month d)) (day d) (year d) in
-     [Data date]
+     [`Data date]
+
+let google_plus = Uri.of_string "https://plus.google.com/share"
+let facebook = Uri.of_string "https://www.facebook.com/share.php"
+let twitter = Uri.of_string "https://twitter.com/intent/tweet"
 
 (* Transform a post [p] (i.e. story) into HTML. *)
-let html_of_post p =
+let html_of_post p : Cow.Html.t =
+  let open Cow in
   let title_anchor = digest_post p in
   let html_title, share = match p.link with
-    | None -> [Data p.title], []
+    | None -> [`Data p.title], []
     | Some u ->
-       let url_orig = Uri.to_string u in
-       let a_args = ["href", url_orig; "target", "_blank";
-                     "title", "Go to the original post"] in
-       let post =
-         Netencoding.Url.encode (planet_full_url ^ "#" ^ title_anchor) in
-       let google = ["href", "https://plus.google.com/share?url="
-                             ^ (Netencoding.Url.encode url_orig);
-                     "target", "_blank"; "title", "Share on Google+"] in
-       let fb = ["href", "https://www.facebook.com/share.php?u=" ^ post
-                         ^ "&amp;t=" ^ (Netencoding.Url.encode p.title);
-                 "target", "_blank"; "title", "Share on Facebook"] in
-       let tw = ["href", "https://twitter.com/intent/tweet?url=" ^ post
-                         ^ "&text=" ^ (Netencoding.Url.encode p.title);
-                 "target", "_blank"; "title", "Share on Twitter"] in
-       let feed = p.contributor.url in
+       let link_orig html = Html.link html ~href:u ~target:`blank
+                                      ~title:"Go to the original post" in
+       let post = Uri.with_fragment planet_full_url (Some title_anchor) in
+       let google = Uri.with_query' google_plus ["url", Uri.to_string u] in
+       let fb = Uri.with_query' facebook ["u", Uri.to_string post;
+                                          "t", p.title] in
+       let tw = Uri.with_query' twitter ["url", Uri.to_string post;
+                                         "text", p.title] in
        let rss =
-         if feed <> "" then
-           [Element("a", ["class", "rss";  "target", "_blank";
-                          "title", "Original RSS feed"; "href", feed],
-                    [Element("img", ["src", "/img/rss.svg"; "alt", "RSS";
-                                     "class", "svg"], []);
-                     Element("img", ["src", "/img/rss.png"; "alt", "RSS";
-                                     "class", "png"], [])] )]
-         else [] in
-       [Element("a", a_args, [Data p.title]) ],
-       [Element("span", ["class", "share"],
-                Element("a", a_args,
-                        [Element("img", ["src", "/img/chain-link-icon.png";
-                                         "alt", ""], []) ])
-                :: Element("a", ("class", "googleplus") :: google,
-                           [Element("img", ["src", "/img/googleplus.png";
-                                            "alt", "Google+"], []) ])
-                :: Element("a", ("class", "facebook") :: fb,
-                           [Element("img", ["src", "/img/facebook.png";
-                                            "alt", "FB"], []) ])
-                :: Element("a", ("class", "twitter") :: tw,
-                           [Element("img", ["src", "/img/twitter.png";
-                                            "alt", "Twitter"], []) ])
-                :: rss) ] in
-  let sep = Data " — " in
+         match p.contributor.url with
+         | Some feed ->
+            [Html.link ~cls:"rss" ~target:`blank
+                       ~href:feed ~title:"Original RSS feed"
+                       [Html.img (Uri.of_string "/img/rss.svg")
+                                 ~alt:"RSS" ~cls:"svg";
+                        Html.img (Uri.of_string "/img/rss.png")
+                                 ~alt:"RSS" ~cls:"png" ]]
+         | None -> [] in
+       [link_orig [`Data p.title]],
+       [`El((n"span", [n"class", "share"]),
+            link_orig [Html.img (Uri.of_string "/img/chain-link-icon.png")]
+            :: Html.link ~href:google ~title:"Share on Google+"
+                         ~cls:"googleplus" ~target:`blank
+                         [Html.img (Uri.of_string "/img/googleplus.png")
+                                   ~alt:"Google+"]
+            :: Html.link ~href:fb ~title:"Share on Facebook"
+                         ~cls:"facebook" ~target:`blank
+                         [Html.img (Uri.of_string "/img/facebook.png")
+                                   ~alt:"FB"]
+            :: Html.link ~href:tw ~title:"Share on Twitter"
+                         ~cls:"twitter" ~target:`blank
+                         [Html.img (Uri.of_string "/img/twitter.png")
+                                   ~alt:"Twitter"]
+            :: rss) ] in
+  let sep = `Data " — " in
   let additional_info = match html_author_of_post p, html_date_of_post p with
     | [], [] -> []
     | html_author, [] -> sep :: html_author
     | [], date -> sep :: date
-    | html_author, date -> sep :: (html_author @ (Data ", " :: date)) in
+    | html_author, date -> sep :: (html_author @ (`Data ", " :: date)) in
   let additional_info =
-    [Element("span", ["class", "additional-info"], additional_info)] in
+    [`El((n"span", [n"class", "additional-info"]), additional_info)] in
   let desc =
     if length_html p.desc < 500 then p.desc
     else toggle (prefix_of_html p.desc 500) p.desc ~anchor:title_anchor
   in
-  [Data "\n";
-   Element("a", ["name", title_anchor], []);
-   Element("section", ["style", "clear: both"],
-           [Element("h1", ["class", "ruled planet"],
-                    share @ html_title @ additional_info);
-            Element("div", ["class", "planet-post"], desc)]);
-   Data "\n"]
+  [`Data "\n";
+   `El((n"a", [n"name", title_anchor]), []);
+   `El((n"section", [n"style", "clear: both"]),
+       [`El((n"h1", [n"class", "ruled planet"]),
+            share @ html_title @ additional_info);
+        `El((n"div", [n"class", "planet-post"]), desc)]);
+   `Data "\n"]
 
 
-let li_of_post p =
-  let sep = Data " — " in
+let li_of_post p : Cow.Html.element =
+  let sep = `Data " — " in
   let title = match p.link with
-    | None -> [Data p.title]
-    | Some u -> [Element("a", ["href", Uri.to_string u; "target", "_blank";
-                              "title", "Go to the original post"],
-                        [Data p.title]) ] in
+    | None -> [`Data p.title]
+    | Some u -> [`El((n"a", [n"href", Uri.to_string u;
+                            n"target", "_blank";
+                            n"title", "Go to the original post"]),
+                    [`Data p.title]) ] in
   let line = match html_author_of_post p, html_date_of_post p with
     | [], [] -> title
     | html_author, [] -> title @ (sep :: html_author)
-    | [], date -> date @ (Data "," :: title)
+    | [], date -> date @ (`Data "," :: title)
     | html_author, date ->
-       date @ (Data ", " :: title @ (sep :: html_author)) in
-  Element("li", [], line)
+       date @ (`Data ", " :: title @ (sep :: html_author)) in
+  `El((n"li", []), line)
 
 let netdate_of_calendar d =
   let month =
@@ -482,18 +482,19 @@ let netdate_of_calendar d =
 
 (* Similar to [html_of_post] but tailored to be shown in a list of
    news (only titles are shown, linked to the page with the full story). *)
-let headline_of_post ?(planet=false) ?(img_alt="") ~l9n ~img p =
+let headline_of_post ?(planet=false) ?(img_alt="") ~l9n ~img p : Cow.Html.t =
+  let open Cow in
   let link =
-    if planet then planet_url ^ "#" ^ digest_post p
-    else match p.link with
-         | Some l -> Uri.to_string l
-         | None -> "" in
-  let html_icon =
-    [Element("a", ["href", link],
-             [Element("img", ["src", img ^ ".svg"; "class", "svg";
-                              "alt", img_alt], []);
-              Element("img", ["src", img ^ ".png"; "class", "png";
-                              "alt", img_alt], [])])] in
+    if planet then Some(Uri.with_fragment planet_url (Some(digest_post p)))
+    else p.link in
+  let html_icon = match link with
+    | Some href ->
+       [Html.link ~href
+                  [Html.img (Uri.of_string(img ^ ".svg")) ~cls:"svg"
+                            ~alt:img_alt;
+                   Html.img (Uri.of_string(img ^ ".png")) ~cls:"png"
+                            ~alt:img_alt] ]
+    | None -> [] in
   let html_date = match p.date with
     | None -> html_icon
     | Some d ->
@@ -505,14 +506,14 @@ let headline_of_post ?(planet=false) ?(img_alt="") ~l9n ~img p =
            Netdate.format ~fmt:"%B %e, %Y" d ~l9n
          else
            Netdate.format ~fmt:"%e %B %Y" d ~l9n in
-       Element("p", [], [Data d]) :: html_icon in
+       `El((n"p", []), [`Data d]) :: html_icon in
   let html_title =
-    Element("h1", [],
-            if link = "" then [Data p.title]
-            else [Element("a", ["href", link; "title", p.title],
-                          [Data p.title])] )in
-  [Element("li", [], [Element("article", [], html_title :: html_date)]);
-   Data "\n"]
+    `El((n"h1", []),
+        match link with
+        | None -> [`Data p.title]
+        | Some href -> [Html.link ~href ~title:p.title [`Data p.title]] ) in
+  [`El((n"li", []), [`El((n"article", []), html_title :: html_date)]);
+   `Data "\n"]
 
 let rec remove n l =
   if n <= 0 then l
@@ -532,15 +533,15 @@ let get_posts ?n ?(ofs=0) () =
   | None -> posts
   | Some n -> take n posts
 
-let headlines ?n ?ofs ?planet ~l9n () =
-  let posts = get_posts ?n ?ofs () in
+let headlines ?n:n_posts ?ofs ?planet ~l9n () : Cow.Html.t =
+  let posts = get_posts ?n:n_posts ?ofs () in
   let img = "/img/news" in
-  [Element("ul", ["class", "news-feed"],
-           List.concat(List.map (headline_of_post ?planet ~l9n ~img) posts))]
+  [`El((n"ul", [n"class", "news-feed"]),
+       List.concat(List.map (headline_of_post ?planet ~l9n ~img) posts))]
 
-let posts ?n ?ofs () =
-  let posts = get_posts ?n ?ofs () in
-  [Element("div", [], List.concat(List.map html_of_post posts))]
+let posts ?n:n_posts ?ofs () : Cow.Html.t =
+  let posts = get_posts ?n:n_posts ?ofs () in
+  [`El((n"div", []), List.concat(List.map html_of_post posts))]
 
 let nposts () = List.length (get_posts ())
 
@@ -570,8 +571,8 @@ module Year_Month = struct
 end
 module DMap = Map.Make(Year_Month)
 
-let list_of_posts ?n ?ofs () =
-  let posts = get_posts ?n ?ofs () in
+let list_of_posts ?n:n_posts ?ofs () : Cow.Html.t =
+  let posts = get_posts ?n:n_posts ?ofs () in
   (* Split posts per year/month *)
   let classify m p =
     match p.date with
@@ -584,8 +585,8 @@ let list_of_posts ?n ?ofs () =
   let add_html (year, month) posts html =
     let title = en_string_of_month month ^ " " ^ string_of_int year in
     let posts = List.sort post_compare posts in
-    Element("h2", ["id", title], [Data title])
-    :: Element("ul", [], List.map li_of_post posts)
+    `El((n"h2", [n"id", title]), [`Data title])
+    :: `El((n"ul", []), List.map li_of_post posts)
     :: html in
   (* Older date considered first => final HTML has more recent dates first *)
   DMap.fold add_html m []
@@ -598,12 +599,11 @@ let aggregate ?n fname =
   let feeds = Lazy.force planet_feeds in
   let to_atom (c: contributor) =
     match c.feed with
-    | Atom a -> Some(Some (Uri.of_string c.url), a)
-    | Rss2 ch -> Some(Some (Uri.of_string c.url), Rss2.to_atom ch)
+    | Atom a -> Some(c.url, a)
+    | Rss2 ch -> Some(c.url, Rss2.to_atom ch)
     | Broken _ -> None in
   let atoms = Utils.filter_map feeds to_atom in
-  let feed = Atom.aggregate atoms
-                            ~title:(Atom.Text "OCaml Planet") in
+  let feed = Atom.aggregate atoms ~title:(Atom.Text "OCaml Planet") in
   let feed = match n with
     | Some n ->
        (* Sort the entries by date and the the [n] most recent ones. *)
@@ -643,7 +643,7 @@ let caml_list_re =
 (** [email_threads] does basically the same as [headlines] but filter
     the posts to have repeated subjects.  It also presents the subject
     better. *)
-let email_threads ?n ~l9n url =
+let email_threads ?n:n_posts ~l9n url =
   (* Do not use [n] yet because posts are filtered. *)
   let posts = posts_of_contributor (feed_of_url ~name:"" url) in
   let posts = List.sort post_compare posts in
@@ -659,12 +659,12 @@ let email_threads ?n ~l9n url =
     if S.mem p.title !seen then false
     else (seen := S.add p.title !seen;  true) in
   let posts = List.filter must_keep posts in
-  let posts = (match n with
+  let posts = (match n_posts with
                | Some n -> take n posts
                | None -> posts) in
   let img = "/img/mail-icon" in
-  [Element("ul", ["class", "news-feed"],
-           List.concat(List.map (fun p -> headline_of_post ~l9n ~img p) posts))]
+  [`El((n"ul", [n"class", "news-feed"]),
+       List.concat(List.map (fun p -> headline_of_post ~l9n ~img p) posts))]
 
 
 (* Main
@@ -703,21 +703,19 @@ let () =
   let anon_arg s = url := s in
   Arg.parse (Arg.align specs) anon_arg "rss2html <URL>";
   let l9n = Netdate.compile_l9n !l9n in
-  let out = new Netchannels.output_channel stdout in
+  let output html = Cow.Html.output (`Channel stdout) html in
   (match !action with
    | `Headlines ->
-      Nethtml.write out (headlines ~planet:true ?n:!n_posts ~ofs:!ofs_posts
-                                   ~l9n ())
-   | `Emails -> Nethtml.write out (email_threads ?n:!n_posts ~l9n !url)
-   | `Posts -> Nethtml.write out (toggle_script
-                                 @ posts ?n:!n_posts ~ofs:!ofs_posts ())
-   | `List ->  Nethtml.write out (list_of_posts ?n:!n_posts ~ofs:!ofs_posts ())
+      output (headlines ~planet:true ?n:!n_posts ~ofs:!ofs_posts ~l9n ())
+   | `Emails -> output (email_threads ?n:!n_posts ~l9n !url)
+   | `Posts -> output (toggle_script
+                      @ posts ?n:!n_posts ~ofs:!ofs_posts ())
+   | `List -> output (list_of_posts ?n:!n_posts ~ofs:!ofs_posts ())
    | `NPosts -> printf "%i" (nposts())
-   | `Subscribers -> Nethtml.write out (html_contributors())
-   | `Opml fn -> opml fn
+   | `Subscribers -> output (html_contributors())
+   | `Opml fn -> opml fn (* output to file [fn]. *)
    | `Aggregate fn -> aggregate fn ?n:!n_posts
-  );
-  out#close_out()
+  );;
 
 
 (* Local Variables: *)

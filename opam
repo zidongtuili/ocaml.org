@@ -17,6 +17,7 @@ depends: [
   "opam2web" {>= "1.4.0"}
   "omd" {>= "1.2.1"}
   "ocamlnet" {>= "3.7.4-1"}
+  "cow"
   "ssl"
   "mpp" {>= "0.1.2"}
   "ocamlrss"
