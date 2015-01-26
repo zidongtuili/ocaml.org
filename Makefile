@@ -1,16 +1,16 @@
 HEADACHE = headache -c _headache.conf
 
-local: script/relative_urls
+local: script/relative_urls download_feeds
 	$(MAKE) staging
 	find ocaml.org -type f | while read f; do \
 	  script/relative_urls --path ocaml.org "$$f"; done
 
-production: pre-build
+production: pre-build download_feeds
 	$(MAKE) gen_md gen_html
 	$(MAKE) syncotherfiles
 	$(RM) ocaml.org/robots.txt
 
-staging: pre-build
+staging: pre-build download_feeds
 	$(MAKE) gen_md gen_html SET_STAGING='-set staging'
 	$(MAKE) syncotherfiles
 
@@ -44,13 +44,14 @@ HTML_FILES = $(patsubst site/%, ocaml.org/%, \
   $(shell find site -type f -name '*.html' -print))
 
 feed: ocaml.org/feed.xml ocaml.org/opml.xml
-ocaml.org/feed.xml: script/rss2html
+ocaml.org/feed.xml: script/rss2html download_feeds
 	mkdir -p $(basename $@)
 	./$< --aggregate $@
-ocaml.org/opml.xml: script/rss2html ocaml.org/feed.xml
+ocaml.org/opml.xml: script/rss2html download_feeds
 	mkdir -p $(basename $@)
 	./$< --opml $@
-
+download_feeds: script/rss2html
+	echo "Number of planet posts: `./$< --nposts`"
 
 gen_md: feed
 	@$(MAKE) -f Makefile.from_md $(MD_FILES)
@@ -77,4 +78,4 @@ clean:
 include Makefile.common
 
 .PHONY: production local staging opam.ocaml.org_template \
-	syncotherfiles deps feed gen_md gen_html headache clean
+	syncotherfiles deps feed download_feeds gen_md gen_html headache clean
