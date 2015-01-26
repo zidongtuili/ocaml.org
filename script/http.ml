@@ -2,19 +2,9 @@
    slows down the rendering to download over and over again the same
    URL. *)
 
-open Printf
-open Http_client.Convenience
-
-let () =
-  Ssl.init();
-  Http_client.Convenience.configure_pipeline
-    (fun p ->
-     let ctx = Ssl.create_context Ssl.TLSv1 Ssl.Client_context in
-     let tct = Https_client.https_transport_channel_type ctx in
-     p # configure_transport Http_client.https_cb_id tct;
-     p#set_options { p#get_options with Http_client.connection_timeout = 5. }
-    )
-
+open Lwt
+open Lwt_io
+module Client = Cohttp_lwt_unix.Client
 
 let age fn =
   let now = Unix.time () in (* in sec *)
@@ -25,34 +15,54 @@ let time_of_secs s =
   let s = truncate s in
   let m = s / 60 and s = s mod 60 in
   let h = m / 60 and m = m mod 60 in
-  sprintf "%i:%02im%is" h m s
+  Printf.sprintf "%i:%02im%is" h m s
+
+let rec read_all_to_buffer b buf len fd =
+  Lwt_unix.read fd buf 0 len >>= fun nread ->
+  if nread = 0 then return()
+  else (
+    (* For OCaml >= 4.02 *)
+    (* Buffer.add_subytes b buf 0 nread; *)
+    Buffer.add_substring b buf 0 nread;
+    read_all_to_buffer b buf len fd
+  )
+
+let read_all fd =
+  let b = Buffer.create 4096 in
+  let buf = Bytes.create 4096 in
+  read_all_to_buffer b buf 4096 fd >>= fun () ->
+  return(Buffer.contents b)
 
 let cache_secs = 3600. (* 1h *)
+
 let get ?(cache_secs=cache_secs) url =
-  let md5 = Digest.to_hex(Digest.string url) in
+  let url_s = Uri.to_string url in
+  let md5 = Digest.to_hex(Digest.string url_s) in
   let fn = Filename.concat Filename.temp_dir_name ("ocamlorg-" ^ md5) in
-  eprintf "Downloading %s ... %!" url;
   let get_from_cache () =
-    let fh = open_in fn in
-    let data = input_value fh in
-    close_in fh;
-    eprintf "done.\n  (using cache %s, updated %s ago).\n%!"
-            fn (time_of_secs(age fn));
-    data in
+    Lwt_unix.(openfile fn [O_RDONLY] 0o600) >>= fun fd ->
+    read_all fd >>= fun data ->
+    Lwt_unix.close fd >>= fun () ->
+    eprintf "Read %S from cache %s (updated %s ago)\n"
+            url_s fn (time_of_secs(age fn))  >>= fun () ->
+    return(`Ok data)
+  in
   if Sys.file_exists fn && age fn <= cache_secs then get_from_cache()
   else (
     try
-      let data = http_get url in
-      eprintf "done %!";
-      let fh = open_out fn in
-      output_value fh data;
-      close_out fh;
-      eprintf "(cached).\n%!";
-      data
-    with Http_client.Http_protocol _ as e ->
-      if Sys.file_exists fn then get_from_cache()
-      else (
-        eprintf "FAILED!\n%!";
-        raise e
+      Client.get url >>= fun (r, b) ->
+      let status = Cohttp.Response.(r.status) in
+      if Cohttp.Code.(is_success(code_of_status status)) then (
+        Cohttp_lwt_body.to_string b >>= fun data ->
+        eprintf "Downloaded %s\n  → %s\n" url_s fn >>= fun () ->
+        Lwt_unix.(openfile fn [O_WRONLY; O_CREAT; O_TRUNC] 0o600) >>= fun fd ->
+        Lwt_unix.write fd data 0 (String.length data) >>= fun _ ->
+        Lwt_unix.close fd >>= fun () ->
+        return(`Ok data)
       )
+      else if Sys.file_exists fn then get_from_cache()
+      else return(`Error status)
+    with Failure msg ->
+      (* This is how name resolution failure is signaled *)
+      return(`Name_resolution_error msg)
   )

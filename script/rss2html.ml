@@ -1,6 +1,6 @@
 (** Render an RSS feed to HTML, for the headlines or the actual posts. *)
 
-open Printf
+open Lwt
 open Nethtml
 open Syndic
 
@@ -96,11 +96,14 @@ type feed =
   | Broken of string (* the argument gives the reason *)
 
 let classify_feed ~xmlbase (xml: string) =
-  try Atom(Atom.parse ~xmlbase (Xmlm.make_input (`String(0, xml))))
-  with Atom.Error.Error _ ->
-          try Rss2(Rss2.parse ~xmlbase (Xmlm.make_input (`String(0, xml))))
-          with Rss2.Error.Error _ ->
-                Broken "Neither Atom nor RSS2 feed"
+  try
+    (try Atom(Atom.parse ~xmlbase (Xmlm.make_input (`String(0, xml))))
+    with Atom.Error.Error _ ->
+      try Rss2(Rss2.parse ~xmlbase (Xmlm.make_input (`String(0, xml))))
+      with Rss2.Error.Error _ ->
+        Broken "Neither Atom nor RSS2 feed")
+  with Xmlm.Error((l,c), err) ->
+    Broken(Printf.sprintf "Xmlm: (%i,%i): %s" l c (Xmlm.error_message err))
 
 type contributor = {
     name  : string;
@@ -109,25 +112,22 @@ type contributor = {
     feed  : feed;
   }
 
-let feed_of_url ~name url_s =
-  let url = Uri.of_string url_s in
-  try
-    let feed = classify_feed ~xmlbase:url (Http.get url_s) in
-    let title = match feed with
-      | Atom atom -> string_of_text_construct atom.Atom.title
-      | Rss2 ch -> ch.Rss2.title
-      | Broken _ -> "" in
-    { name;  title;  url = Some url;  feed }
-  with
-  | Http_client.Http_protocol(Http_client.Timeout s)
-  | Http_client.Http_protocol(Http_client.Name_resolution_error s) ->
-     { name;  title = "";  url = Some url;  feed = Broken s }
-  | Http_client.Http_protocol Http_client.Too_many_redirections ->
-     { name;  title = "";  url = Some url;
-       feed = Broken "Too many redirections" }
-  | Http_client.Http_error(err, _) ->
-     let msg = Nethttp.(string_of_http_status (http_status_of_int err)) in
-     { name;  title = "";  url = Some url;  feed = Broken msg }
+let feed_of_url ~name url =
+  Http.get url >>= function
+  | `Ok xml ->
+     let feed = classify_feed ~xmlbase:url xml in
+     let title = match feed with
+       | Atom atom -> string_of_text_construct atom.Atom.title
+       | Rss2 ch -> ch.Rss2.title
+       | Broken s ->
+          Printf.printf "• %s\n%!" s;
+          "" in
+     return { name;  title;  url = Some url;  feed }
+  | `Name_resolution_error s ->
+     return { name;  title = "";  url = Some url;  feed = Broken s }
+  | `Error s ->
+     return { name;  title = "";  url = Some url;
+              feed = Broken(Cohttp.Code.string_of_status s) }
 
 let planet_feeds =
   let add_feed acc line =
@@ -135,12 +135,16 @@ let planet_feeds =
       let i = String.index line '|' in
       let name = String.sub line 0 i in
       let url = String.sub line (i+1) (String.length line - i - 1) in
-      feed_of_url ~name url :: acc
+      (name, Uri.of_string url) :: acc
     with Not_found -> acc in
-  lazy(List.fold_left add_feed [] (Utils.lines_of_file planet_feeds_file))
+  List.fold_left add_feed [] (Utils.lines_of_file planet_feeds_file)
+
+let planet_feeds =
+  Lwt_list.map_p (fun (name, url) -> feed_of_url ~name url) planet_feeds
+
 
 let html_contributors () =
-  let feeds = Lazy.force planet_feeds in
+  planet_feeds >>= fun feeds ->
   let contributors =
     List.sort (fun c1 c2 -> String.compare c1.name c2.name) feeds in
   let contrib_html c =
@@ -152,7 +156,7 @@ let html_contributors () =
                       [`Data c.name])]
       | None -> [`Data c.name] in
     `El((n"li", []), li) in
-  [`El((n"ul", []), List.map contrib_html contributors)]
+  return [`El((n"ul", []), List.map contrib_html contributors)]
 
 
 let to_opml feeds =
@@ -170,8 +174,10 @@ let to_opml feeds =
 
 let opml fname =
   let fh = open_out fname in
-  Syndic.Opml1.output (to_opml(Lazy.force planet_feeds)) (`Channel fh);
-  close_out fh
+  planet_feeds >>= fun feeds ->
+  Syndic.Opml1.output (to_opml feeds) (`Channel fh);
+  close_out fh;
+  return()
 
 
 
@@ -323,13 +329,13 @@ let rec prefix_of_html html len =
 
 let new_id =
   let id = ref 0 in
-  fun () -> incr id; sprintf "ocamlorg-post%i" !id
+  fun () -> incr id; Printf.sprintf "ocamlorg-post%i" !id
 
 (* [toggle html1 html2] return some piece of html with buttons to pass
    from [html1] to [html2] and vice versa. *)
 let toggle ?(anchor="") html1 html2 =
   let button id1 id2 text =
-    `El((n"a", [n"onclick", sprintf "switchContent('%s','%s')" id1 id2;
+    `El((n"a", [n"onclick", Printf.sprintf "switchContent('%s','%s')" id1 id2;
                 n"class", "btn planet-toggle";
                 n"href", "#" ^ anchor]),
         [`Data text])
@@ -381,7 +387,8 @@ let html_date_of_post p =
   | Some d ->
      let date =
        let open Syndic.Date in
-       sprintf "%s %02d, %d" (string_of_month(month d)) (day d) (year d) in
+       Printf.sprintf "%s %02d, %d"
+                      (string_of_month(month d)) (day d) (year d) in
      [`Data date]
 
 let google_plus = Uri.of_string "https://plus.google.com/share"
@@ -525,25 +532,26 @@ let rec take n = function
   | e :: tl -> if n > 0 then e :: take (n-1) tl else []
 
 let get_posts ?n ?(ofs=0) () =
-  let feeds = Lazy.force planet_feeds in
+  planet_feeds >>= fun feeds ->
   let posts = List.concat (List.map posts_of_contributor feeds) in
   let posts = List.sort post_compare posts in
   let posts = remove ofs posts in
   match n with
-  | None -> posts
-  | Some n -> take n posts
+  | None -> return posts
+  | Some n -> return(take n posts)
 
-let headlines ?n:n_posts ?ofs ?planet ~l9n () : Cow.Html.t =
-  let posts = get_posts ?n:n_posts ?ofs () in
+let headlines ?n:n_posts ?ofs ?planet ~l9n () : Cow.Html.t Lwt.t =
+  get_posts ?n:n_posts ?ofs () >>= fun posts ->
   let img = "/img/news" in
-  [`El((n"ul", [n"class", "news-feed"]),
-       List.concat(List.map (headline_of_post ?planet ~l9n ~img) posts))]
+  let html = List.concat(List.map (headline_of_post ?planet ~l9n ~img) posts) in
+  return [`El((n"ul", [n"class", "news-feed"]), html )]
 
-let posts ?n:n_posts ?ofs () : Cow.Html.t =
-  let posts = get_posts ?n:n_posts ?ofs () in
-  [`El((n"div", []), List.concat(List.map html_of_post posts))]
+let posts ?n:n_posts ?ofs () : Cow.Html.t Lwt.t =
+  get_posts ?n:n_posts ?ofs () >>= fun posts ->
+  return [`El((n"div", []), List.concat(List.map html_of_post posts))]
 
-let nposts () = List.length (get_posts ())
+let nposts () =
+  get_posts () >>= fun posts -> return(List.length posts)
 
 
 let en_string_of_month =
@@ -571,8 +579,8 @@ module Year_Month = struct
 end
 module DMap = Map.Make(Year_Month)
 
-let list_of_posts ?n:n_posts ?ofs () : Cow.Html.t =
-  let posts = get_posts ?n:n_posts ?ofs () in
+let list_of_posts ?n:n_posts ?ofs () : Cow.Html.t Lwt.t =
+  get_posts ?n:n_posts ?ofs () >>= fun posts ->
   (* Split posts per year/month *)
   let classify m p =
     match p.date with
@@ -589,14 +597,14 @@ let list_of_posts ?n:n_posts ?ofs () : Cow.Html.t =
     :: `El((n"ul", []), List.map li_of_post posts)
     :: html in
   (* Older date considered first => final HTML has more recent dates first *)
-  DMap.fold add_html m []
+  return(DMap.fold add_html m [])
 
 
 (* Aggregation of posts
  ***********************************************************************)
 
 let aggregate ?n fname =
-  let feeds = Lazy.force planet_feeds in
+  planet_feeds >>= fun feeds ->
   let to_atom (c: contributor) =
     match c.feed with
     | Atom a -> Some(c.url, a)
@@ -614,7 +622,8 @@ let aggregate ?n fname =
     | None -> feed in
   let fh = open_out fname in
   Atom.output feed (`Channel fh);
-  close_out fh
+  close_out fh;
+  return()
 
 
 (* Email threads
@@ -645,7 +654,8 @@ let caml_list_re =
     better. *)
 let email_threads ?n:n_posts ~l9n url =
   (* Do not use [n] yet because posts are filtered. *)
-  let posts = posts_of_contributor (feed_of_url ~name:"" url) in
+  feed_of_url ~name:"" url >>= fun contributor ->
+  let posts = posts_of_contributor contributor in
   let posts = List.sort post_compare posts in
   let normalize_title p =
     let title = Str.replace_first caml_list_re "" p.title in
@@ -663,15 +673,16 @@ let email_threads ?n:n_posts ~l9n url =
                | Some n -> take n posts
                | None -> posts) in
   let img = "/img/mail-icon" in
-  [`El((n"ul", [n"class", "news-feed"]),
-       List.concat(List.map (fun p -> headline_of_post ~l9n ~img p) posts))]
+  let html =
+    List.concat(List.map (fun p -> headline_of_post ~l9n ~img p) posts) in
+  return [`El((n"ul", [n"class", "news-feed"]), html )]
 
 
 (* Main
  ***********************************************************************)
 
 let () =
-  let url = ref "" in
+  let url = ref(Uri.of_string "") in
   let action = ref `Posts in
   let n_posts = ref None in (* means unlimited *)
   let ofs_posts = ref 0 in
@@ -700,22 +711,29 @@ let () =
     ("--locale",
      Arg.String(fun l -> l9n := Netdate.(l9n_from_locale l)),
      "l Translate dates for the locale l")  ] in
-  let anon_arg s = url := s in
+  let anon_arg s = url := Uri.of_string s in
   Arg.parse (Arg.align specs) anon_arg "rss2html <URL>";
   let l9n = Netdate.compile_l9n !l9n in
-  let output html = Cow.Html.output (`Channel stdout) html in
-  (match !action with
+  let output html =
+    html >>= fun html ->
+    Cow.Html.output (`Channel stdout) html;
+    return()in
+  let main = match !action with
    | `Headlines ->
       output (headlines ~planet:true ?n:!n_posts ~ofs:!ofs_posts ~l9n ())
    | `Emails -> output (email_threads ?n:!n_posts ~l9n !url)
-   | `Posts -> output (toggle_script
-                      @ posts ?n:!n_posts ~ofs:!ofs_posts ())
+   | `Posts ->
+      posts ?n:!n_posts ~ofs:!ofs_posts () >>= fun p ->
+      return(toggle_script @ p) |>
+      output
    | `List -> output (list_of_posts ?n:!n_posts ~ofs:!ofs_posts ())
-   | `NPosts -> printf "%i" (nposts())
+   | `NPosts -> nposts()
+               >>= fun n -> Lwt_io.printf "%i" n
    | `Subscribers -> output (html_contributors())
    | `Opml fn -> opml fn (* output to file [fn]. *)
    | `Aggregate fn -> aggregate fn ?n:!n_posts
-  );;
+  in
+  Lwt_main.run main
 
 
 (* Local Variables: *)

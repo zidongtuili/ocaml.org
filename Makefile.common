@@ -8,7 +8,7 @@ OMD_PP = script/md_preprocess
 
 OCAML_VERSION = $(shell ocamlc -config | grep version | sed -e "s/version: *//")
 
-OCAMLFLAGS = -annot
+OCAMLFLAGS = -annot -g
 OCAMLOPT = ocamlfind ocamlopt $(OCAMLFLAGS)
 OCAMLC = ocamlfind ocamlc $(OCAMLFLAGS)
 
@@ -56,7 +56,7 @@ script/breadcrumb: script/breadcrumb.ml $(UTILS_DEP)
 
 script/rss2html: script/rss2html.ml script/http.ml $(UTILS_DEP)
 	cd script && \
-	$(OCAMLOPT) -package netstring,equeue-ssl,netclient,cow,syndic \
+	$(OCAMLOPT) -package netstring,bytes,lwt,cohttp.lwt,cow,syndic \
 	  -linkpkg utils.cmx http.ml rss2html.ml -o ../"$@"
 
 script/ocamltohtml:script/lexer.ml script/ocamltohtml.ml

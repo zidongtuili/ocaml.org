@@ -18,11 +18,13 @@ depends: [
   "omd" {>= "1.2.1"}
   "ocamlnet" {>= "3.7.4-1"}
   "cow"
+  "cohttp"
   "ssl"
   "mpp" {>= "0.1.2"}
   "ocamlrss"
   "uri" {>= "1.3.11"}
   "syndic" {>= "1.1"}
+  "bytes"
   "camlp4"
 ]
 depopts: [
