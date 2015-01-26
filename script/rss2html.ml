@@ -78,14 +78,38 @@ let html_of_text ?xmlbase s =
   with _ ->
     [`Data s]
 
+let html_of_text =
+  (* FIXME: At the moment, the Cow parser is not robust enough, use
+     ocamlnet *)
+  let rec to_cow html : Cow.Html.t =
+    List.map to_cow_el html
+  and to_cow_el = function
+    | Nethtml.Element(t, attrs, s) ->
+       let attrs = List.map (fun (name,v) -> (n name, v)) attrs in
+       `El((n t, attrs), to_cow s)
+    | Nethtml.Data d -> `Data d in
+  fun ?xmlbase s ->
+  try to_cow(Nethtml.parse (new Netchannels.input_string s)
+                           ~dtd:Utils.relaxed_html40_dtd)
+      |> resolve ?xmlbase
+      |> remove_undesired_tags
+  with _ ->
+    [`Data s]
+
+let rec xml_of_syndic xml : Cow.Xml.t =
+  List.map xml_of_syndic_el xml
+and xml_of_syndic_el = function
+  | XML.Node(_, t, s) -> `El(t, xml_of_syndic s)
+  | XML.Data(_, d) -> `Data d
+
 (* Do not trust sites using XML for HTML content.  Convert to string
    and parse back.  (Does not always fix bad HTML unfortunately.) *)
 let rec html_of_syndic =
   let ns_prefix _ = Some "" in
   fun ?xmlbase h ->
-  html_of_text ?xmlbase
-               (String.concat "" (List.map (XML.to_string ~ns_prefix) h))
-
+  (* html_of_text ?xmlbase *)
+  (*              (String.concat "" (List.map (XML.to_string ~ns_prefix) h)) *)
+  xml_of_syndic h
 
 (* Feeds
  ***********************************************************************)
@@ -119,9 +143,7 @@ let feed_of_url ~name url =
      let title = match feed with
        | Atom atom -> string_of_text_construct atom.Atom.title
        | Rss2 ch -> ch.Rss2.title
-       | Broken s ->
-          Printf.printf "• %s\n%!" s;
-          "" in
+       | Broken s -> "" in
      return { name;  title;  url = Some url;  feed }
   | `Name_resolution_error s ->
      return { name;  title = "";  url = Some url;  feed = Broken s }
@@ -716,7 +738,7 @@ let () =
   let l9n = Netdate.compile_l9n !l9n in
   let output html =
     html >>= fun html ->
-    Cow.Html.output (`Channel stdout) html;
+    Cow.Html.output (`Channel stdout) html ~ns_prefix:(fun _ -> Some "");
     return()in
   let main = match !action with
    | `Headlines ->

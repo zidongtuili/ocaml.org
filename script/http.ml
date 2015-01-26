@@ -43,7 +43,7 @@ let get ?(cache_secs=cache_secs) url =
     Lwt_unix.(openfile fn [O_RDONLY] 0o600) >>= fun fd ->
     read_all fd >>= fun data ->
     Lwt_unix.close fd >>= fun () ->
-    eprintf "Read %S from cache %s (updated %s ago)\n"
+    eprintf "Got %s\n  ← %s (updated %s ago)\n"
             url_s fn (time_of_secs(age fn))  >>= fun () ->
     return(`Ok data)
   in
