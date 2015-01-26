@@ -33,6 +33,22 @@ let read_all fd =
   read_all_to_buffer b buf 4096 fd >>= fun () ->
   return(Buffer.contents b)
 
+(* Handle redirections.  [n] is the maximum number of refirections. *)
+let rec http_get ?(redirect=5) uri =
+  Client.get uri >>= fun ((r, _) as rb) ->
+  match Cohttp.Response.(r.status) with
+  | `Moved_permanently
+  | `Found
+  | `See_other ->
+     if redirect > 0 then
+       match Cohttp.Header.get Cohttp.Response.(r.headers) "Location" with
+       | Some new_uri ->
+          let uri = Uri.resolve "http" uri (Uri.of_string new_uri) in
+          http_get ~redirect:(redirect - 1) uri
+       | None -> return rb
+     else return rb
+  | _ -> return rb
+
 let cache_secs = 3600. (* 1h *)
 
 let get ?(cache_secs=cache_secs) url =
@@ -50,7 +66,7 @@ let get ?(cache_secs=cache_secs) url =
   if Sys.file_exists fn && age fn <= cache_secs then get_from_cache()
   else (
     try
-      Client.get url >>= fun (r, b) ->
+      http_get url >>= fun (r, b) ->
       let status = Cohttp.Response.(r.status) in
       if Cohttp.Code.(is_success(code_of_status status)) then (
         Cohttp_lwt_body.to_string b >>= fun data ->
