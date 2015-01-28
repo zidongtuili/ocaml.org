@@ -375,8 +375,8 @@ let toggle_script : Cow.Html.t =
      var contentId1 = document.getElementById(id1);
      var contentId2 = document.getElementById(id2);
      // Toggle
-     contentId1.style.display = \"none\";
-     contentId2.style.display = \"block\";
+     contentId1.style.display = 'none';
+     contentId2.style.display = 'block';
      }\n" in
   [`El((n"script", [n"type", "text/javascript"]), [`Data script])]
 
