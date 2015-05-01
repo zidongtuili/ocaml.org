@@ -1,5 +1,7 @@
 (* Syntax hightlight code and eval ocaml toplevel phrases *)
 
+open Core_kernel.Std
+open Async.Std
 open Printf
 open Scanf
 open Code_types
@@ -116,7 +118,7 @@ let highlight_ocaml =
       \\|ref\\|mutable\\|new\\)\\b",
      "<span class=\"keyword\">\\1</span>");
   ] in
-  let subst = List.map (fun (re, t) -> (Str.regexp re, t)) subst in
+  let subst = List.map subst ~f:(fun (re, t) -> (Str.regexp re, t)) in
   let beg_quot = Str.regexp "&quot;" in
   let end_quot = Str.regexp "[^\\]&quot;" in
   let rec color_string s =
@@ -133,8 +135,8 @@ let highlight_ocaml =
   in
   fun phrase -> (
     let phrase = color_string(html_encode phrase) in
-    let p = List.fold_left (fun h (re, t) -> Str.global_replace re t h)
-                           phrase subst in
+    let p = List.fold_left ~f:(fun h (re, t) -> Str.global_replace re t h)
+                           ~init:phrase subst in
     (* Wrap the code in a <pre> block so no Omd.Paragraph are generated, etc. *)
     match Omd.of_string ("<pre>" ^ p ^ "</pre>") with
     | [Omd.Html_block(_,_,o)] -> o
@@ -187,7 +189,7 @@ let toploop_eval (top: toplevel) (phrase: string) : outcome =
 (** Return the same document as [md] but with all strings transformed
     by [f].  [f] is applied in the order of appearance of the strings. *)
 let rec omd_map_string f md =
-  List.map (omd_map_string_el f) md
+  List.map md ~f:(omd_map_string_el f)
 and omd_map_string_el f md =
   let open Omd in
   match md with
@@ -201,10 +203,10 @@ and omd_map_string_el f md =
   | Text s -> Text(f s)
   | Emph o -> Emph(omd_map_string f o)
   | Bold o -> Bold(omd_map_string f o)
-  | Ul o -> Ul(List.map (omd_map_string f) o)
-  | Ol o -> Ol(List.map (omd_map_string f) o)
-  | Ulp o -> Ulp(List.map (omd_map_string f) o)
-  | Olp o -> Olp(List.map (omd_map_string f) o)
+  | Ul o -> Ul(List.map ~f:(omd_map_string f) o)
+  | Ol o -> Ol(List.map ~f:(omd_map_string f) o)
+  | Ulp o -> Ulp(List.map ~f:(omd_map_string f) o)
+  | Olp o -> Olp(List.map ~f:(omd_map_string f) o)
   | Code(name, s) -> Code(name, f s)
   | Code_block(name, s) -> Code_block(name, f s)
   | Url(h, o, t) -> Url(h, omd_map_string f o, t)
@@ -242,7 +244,7 @@ let html_of_eval_silent t phrase =
 
 
 let rec omd_transform_text f md =
-  List.rev (List.fold_left (omd_transform_text_el f) [] md)
+  List.rev (List.fold_left ~f:(omd_transform_text_el f) ~init:[] md)
 and omd_transform_text_el f acc md =
   let open Omd in
   match md with
@@ -256,10 +258,10 @@ and omd_transform_text_el f acc md =
   | Text s | Raw s -> List.rev_append (f s) acc
   | Emph o -> Emph(omd_transform_text f o) :: acc
   | Bold o -> Bold(omd_transform_text f o) :: acc
-  | Ul o -> Ul(List.map (omd_transform_text f) o) :: acc
-  | Ol o -> Ol(List.map (omd_transform_text f) o) :: acc
-  | Ulp o -> Ulp(List.map (omd_transform_text f) o) :: acc
-  | Olp o -> Olp(List.map (omd_transform_text f) o) :: acc
+  | Ul o -> Ul(List.map ~f:(omd_transform_text f) o) :: acc
+  | Ol o -> Ol(List.map ~f:(omd_transform_text f) o) :: acc
+  | Ulp o -> Ulp(List.map ~f:(omd_transform_text f) o) :: acc
+  | Olp o -> Olp(List.map ~f:(omd_transform_text f) o) :: acc
   | Url(h, o, t) -> Url(h, omd_transform_text f o, t) :: acc
   | Html(name, args, o) -> Html(name, args, omd_transform_text f o) :: acc
   | Html_block(name, args, o) ->
@@ -359,7 +361,7 @@ let end_of_phrase = Str.regexp ";;[ \t\n]*"
 
 let to_html t phrases : Omd.t =
   (* Split phrases *)
-  let phrases = List.map String.trim (Str.split end_of_phrase phrases) in
+  let phrases = List.map ~f:String.strip (Str.split end_of_phrase phrases) in
   List.concat (List.map (html_of_eval t) phrases)
 
 
