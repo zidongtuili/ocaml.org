@@ -4,7 +4,6 @@ open Core_kernel.Std
 open Async.Std
 open Printf
 open Scanf
-open Code_types
 open Utils
 
 (* To HTML, with syntax highlighting
@@ -151,41 +150,6 @@ let highlight ?(syntax="ocaml") phrase =
 (* Eval OCaml code — in the same way the toploop does
  ***********************************************************************)
 
-type toplevel_ =
-  | Sleep of string (* command to execute to start the toplevel *)
-  | Run of (in_channel * out_channel)
-
-type toplevel = toplevel_ ref
-
-(* Store the information to start the toplevel — only start it if needed. *)
-let toplevel ?(pgm="./script/code_top") () : toplevel =
-  ref(Sleep pgm)
-
-let get_toplevel (top: toplevel) =
-  match !top with
-  | Run t -> t
-  | Sleep pgm ->
-     let (from_top, _) as t = Unix.open_process pgm in
-     top := Run t;
-     t
-
-let close_toplevel (top: toplevel) =
-  match !top with
-  | Sleep _ -> ()
-  | Run((from_top, to_top) as top) ->
-     (match Unix.close_process top with
-      | Unix.WEXITED i -> if i <> 0 then eprintf "WEXITED %i\n%!" i
-      | Unix.WSIGNALED i -> eprintf "WSIGNALED %i\n%!" i
-      | Unix.WSTOPPED i -> eprintf "WSTOPPED %i\n%!" i)
-
-let toploop_eval (top: toplevel) (phrase: string) : outcome =
-  let (from_top, to_top) = get_toplevel top in
-  output_string to_top phrase;
-  output_string to_top "\n;;\n"; (* code_top excepts ";;" on its own line *)
-  flush to_top;
-  let o = get_outcome from_top in
-  o
-
 (** Return the same document as [md] but with all strings transformed
     by [f].  [f] is applied in the order of appearance of the strings. *)
 let rec omd_map_string f md =
@@ -232,14 +196,16 @@ let format_eval_input phrase : Omd.t =
   add_prompt (highlight_ocaml phrase)
 
 let html_of_eval_silent t phrase =
-  begin match toploop_eval t phrase with
-    | Normal _ -> ()
-    | Error s ->
-       (* as no output shows in the rendered page,
-          we deem it useful to have errors reported
-          at least in the compilation buffer. *)
-       eprintf "Error %S during silent evaluation of the phrase %S\n" s phrase
-  end;
+  Oloop.eval t phrase
+  >>| (function
+        | `Eval _ -> ()
+        | `Uneval(_, s) ->
+           (* As no output shows in the rendered page, we deem it
+              useful to have errors reported at least in the
+              compilation buffer. *)
+           eprintf "Error %S during silent evaluation of the phrase %S\n"
+                   s phrase
+      ) >>| fun () ->
   format_eval_input phrase
 
 
@@ -270,13 +236,13 @@ and omd_transform_text_el f acc md =
   | e -> e :: acc
 
 let html_error txt =
-  Omd.Html("span", ["class", Some "ocaml-error-loc"],
-           [Omd.Raw(html_encode txt)])
+  Omd.Html_block("span", ["class", Some "ocaml-error-loc"],
+                 [Omd.Raw(html_encode txt)])
 
 (* Insert the HTML code to highligh the error located in [phrase] at
    chars [c1 .. c2[.  [phrase] is a syntax highlighted HTML
    representation of the code. *)
-let highlight_error_range phrase err_msg c1 c2 =
+let highlight_error_range phrase c1 c2 =
   let c1 = ref c1 and c2 = ref c2 in
   let split html =
     let txt = html_decode html in
@@ -302,53 +268,36 @@ let highlight_error_range phrase err_msg c1 c2 =
     c1 := !c1 - len;  c2 := !c2 - len;
     r in
   let phrase = omd_transform_text split phrase in
-  let nl = 1 + String.index err_msg '\n' in
-  let err_msg = String.sub err_msg nl (String.length err_msg - nl) in
-  (phrase: Omd.t), err_msg
+  (phrase: Omd.t)
 
-
-let error_re312 =
-  Str.regexp ".*[Cc]haracters +\\([0-9]+\\)-\\([0-9]+\\)"
-
-let error_re400 =
-  Str.regexp ".*line +\\([0-9]+\\),.*\
-              [Cc]haracters +\\([0-9]+\\)-\\([0-9]+\\)"
 
 (* Process [err_msg] to see whether one needs to highlight part of the
    [phrase].  *)
-let highlight_error phrase err_msg =
-  if Str.string_match error_re400 err_msg 0 then (
-    let l =  try int_of_string(Str.matched_group 1 err_msg) with _ -> 0 in
-    let c1 = int_of_string(Str.matched_group 2 err_msg)
-    and c2 = int_of_string(Str.matched_group 3 err_msg) in
-    (* Convert the line [1 .. l-1] into character count. *)
-    let c = ref 0 in
-    for line = 1 to l - 1 do c := String.index_from phrase !c '\n' + 1 done;
-    let phrase = highlight_ocaml phrase in
-    highlight_error_range phrase err_msg (c1 + !c) (c2 + !c)
-  )
-  else if Str.string_match error_re312 err_msg 0 then (
-    let c1 = int_of_string(Str.matched_group 1 err_msg)
-    and c2 = int_of_string(Str.matched_group 2 err_msg) in
-    let phrase = highlight_ocaml phrase in
-    highlight_error_range phrase err_msg c1 c2
-  )
-  else
-    highlight_ocaml phrase, err_msg
+let highlight_error phrase loc =
+  let c1 = loc.Location.loc_start.Lexing.pos_cnum in
+  let c2 = loc.Location.loc_end.Lexing.pos_cnum in
+  let phrase = highlight_ocaml phrase in
+  highlight_error_range phrase c1 c2
 
 let html_of_eval t phrase =
-  let phrase, cls, out = match toploop_eval t phrase with
-    | Normal(s, out, err) ->
-       let phrase, err = highlight_error phrase err in
-       phrase, "ocaml-output",
-       [Omd.Html("span", ["class", Some "ocaml-stdout"],
-                 [Omd.Raw(html_encode out)]);
-        Omd.Html("span", ["class", Some "ocaml-stderr"],
-                 [Omd.Raw(html_encode err)]);
-        Omd.Raw(html_encode s)]
-    | Error s ->
-       let phrase, s = highlight_error phrase s in
-       phrase, "ocaml-error", [Omd.Raw(html_encode s)] in
+  Oloop.eval t phrase
+  >>| (function
+        | `Eval o ->
+           let b = Buffer.create 1024 in
+           !Oprint.out_phrase (Format.formatter_of_buffer b)
+            (Oloop.Outcome.result o);
+           highlight_ocaml phrase, "ocaml-output",
+           [Omd.Html("span", ["class", Some "ocaml-stdout"],
+                     [Omd.Raw(html_encode(Oloop.Outcome.stdout o))]);
+            Omd.Html("span", ["class", Some "ocaml-stderr"],
+                     [Omd.Raw(html_encode(Oloop.Outcome.stderr o))]);
+           Omd.Raw(html_encode(Buffer.contents b))]
+        | `Uneval(e, msg) ->
+           let phrase = match Oloop.Outcome.location_of_uneval e with
+             | Some loc -> highlight_error phrase loc
+             | None -> highlight_ocaml phrase in
+           phrase, "ocaml-error", [Omd.Raw(html_encode(msg))]
+      ) >>| fun (phrase, cls, out) ->
   add_prompt phrase
   @ [ Omd.Html("br", [], []);
       Omd.Html("span", ["class", Some cls], out) ]
@@ -359,10 +308,11 @@ let html_of_eval t phrase =
 let end_of_phrase = Str.regexp ";;[ \t\n]*"
 
 
-let to_html t phrases : Omd.t =
+let to_html t phrases : Omd.t Deferred.t =
   (* Split phrases *)
   let phrases = List.map ~f:String.strip (Str.split end_of_phrase phrases) in
-  List.concat (List.map (html_of_eval t) phrases)
+  Deferred.List.map ~f:(html_of_eval t) phrases >>| fun l ->
+  List.concat l
 
 
 (* Local Variables: *)

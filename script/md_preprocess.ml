@@ -1,43 +1,48 @@
 (* Script preprocessing Markdown to enable special conventions. *)
 
-open Printf
+open Core.Std
+open Async.Std
 
 (* Code evaluation
  ***********************************************************************)
-
-let toplevel = Code.toplevel()
 
 (* FIXME: Once evaluated, the code blocks are rendered to HTML <pre>.
    These must necessarily start at the beginning of lines and thus
    cannot be, say, in blockquotes (this does not seem to be a problem
    with omd though). *)
-let rec eval_code_blocks md =
+let rec eval_code_blocks toplevel md =
   let open Omd in
   match md with
   | Code_block("tryocaml", code) :: tl
   | Code_block("ocamltop", code) :: tl ->
-     let html = Code.to_html toplevel code in
+     Code.to_html toplevel code >>= fun html ->
+     eval_code_blocks toplevel tl >>| fun tl ->
      Html_block("pre", [], [Html("code", ["class", Some "ocamltop"], html)])
-     :: eval_code_blocks tl
+     :: tl
   | Code_block("ocaml", code) :: tl ->
      let html = Code.highlight code in
+     eval_code_blocks toplevel tl >>| fun tl ->
      Html_block("pre", [], [Html("code", ["class", Some "ocaml"], html)])
-     :: eval_code_blocks tl
+     :: tl
   | Blockquote t :: tl ->
      (* Order of evaluation is important: the code in [Blockquote] may
         have toplevel effects needed by later blocks. *)
-     let t = eval_code_blocks t in
-     Blockquote t :: eval_code_blocks tl
+     eval_code_blocks toplevel t >>= fun t ->
+     eval_code_blocks toplevel tl >>| fun tl ->
+     Blockquote t :: tl
   | Html(name, args, t) :: tl ->
-     let t = eval_code_blocks t in
-     Html(name, args, t) :: eval_code_blocks tl
+     eval_code_blocks toplevel t >>= fun t ->
+     eval_code_blocks toplevel tl >>| fun tl ->
+     Html(name, args, t) :: tl
   | Html_block(name, args, t) :: tl ->
-     let t = eval_code_blocks t in
-     Html_block(name, args, t) :: eval_code_blocks tl
+     eval_code_blocks toplevel t >>= fun t ->
+     eval_code_blocks toplevel tl >>| fun tl ->
+     Html_block(name, args, t) :: tl
   | e :: tl ->
      (* FIXME: do we want to recurse in other tags? *)
-     e :: eval_code_blocks tl
-  | [] -> []
+     eval_code_blocks toplevel tl >>| fun tl ->
+     e :: tl
+  | [] -> return []
 
 
 (* Solutions toggle
@@ -87,17 +92,23 @@ let rec toggle_solutions any_change md =
   | [] -> []
 
 
-let () =
+let main () =
   let ch = new Netchannels.input_channel stdin in
   let md = Netchannels.string_of_in_obj_channel ch in
   let md = Omd.of_string md in
   (* Enable custom transformations. *)
-  let md = eval_code_blocks md in
+  Oloop.create Oloop.Outcome.separate >>=? fun toplevel ->
+  eval_code_blocks toplevel md >>| fun md ->
   let any_change = ref false in
   let md = toggle_solutions any_change md in
   let md = if !any_change then toggle_js :: md else md in
-  print_string(Omd.to_markdown md)
+  print_string(Omd.to_markdown md);
+  shutdown 0;
+  Ok()
 
+let () =
+  ignore(main() >>| fun _ -> shutdown 1);
+  never_returns (Scheduler.go ())
 
 (* Local Variables: *)
 (* compile-command: "make --no-print-directory -k -C .. script/md_preprocess" *)
