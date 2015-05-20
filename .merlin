@@ -3,5 +3,6 @@ PKG netclient
 PKG syndic
 PKG uri
 PKG omd
+PKG oloop
 S script
 B script
