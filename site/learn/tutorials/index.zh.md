@@ -22,7 +22,7 @@ OCaml是一种快速、简洁、而强大的应用程序开发语言－－我想
 * [函数式编程](functional_programming.zh.html)
 * [If语句，循环和递归](if_statements_loops_and_recursion.zh.html)
 * [标签](labels.zh.html)
-* 常见的错误信息 - [en](common_error_messages.html)
+* [常见的错误信息](common_error_messages.zh.html)
 * OCaml编程风格 - [en](guidelines.html)
 * 文本的格式化和包装 - [en](format.html)
 * OCaml的99个问题（已解决） - [en](99problems.html)
